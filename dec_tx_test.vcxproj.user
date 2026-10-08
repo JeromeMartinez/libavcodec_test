@@ -11,9 +11,9 @@
     <LocalDebuggerWorkingDirectory>D:\Programmation\dec_tx_test\</LocalDebuggerWorkingDirectory>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
-    <LocalDebuggerCommandArguments>6k5k16bit.dpx 0 1 1</LocalDebuggerCommandArguments>
+    <LocalDebuggerCommandArguments>6k5k16bit.dpx 0 1 1 100</LocalDebuggerCommandArguments>
     <DebuggerFlavor>WindowsLocalDebugger</DebuggerFlavor>
-    <LocalDebuggerCommandArgumentsHistory>D:\Programmation\dec_tx_test\6k5k16bit.dpx 0 1 1|D:\Programmation\ffmpeg_vulkan\ffmpeg\2x2.dpx 0 0 1|D:\Programmation\ffmpeg_vulkan\ffmpeg\6k5k16bit.dpx 0 1 1|D:\Programmation\ffmpeg_vulkan\ffmpeg\2x2.dpx 0 1 1|6k5k16bit.dpx 0 1 1|</LocalDebuggerCommandArgumentsHistory>
+    <LocalDebuggerCommandArgumentsHistory>D:\Programmation\ffmpeg_vulkan\ffmpeg\6k5k16bit.dpx 0 1 1|D:\Programmation\ffmpeg_vulkan\ffmpeg\2x2.dpx 0 1 1|6k5k16bit.dpx 0 1 1|6k5k16bit.dpx 0 1 1 2|6k5k16bit.dpx 0 1 1 100|</LocalDebuggerCommandArgumentsHistory>
     <LocalDebuggerWorkingDirectory>D:\Programmation\dec_tx_test</LocalDebuggerWorkingDirectory>
     <LocalDebuggerEnvironment>VK_LAYER_PRINTF_BUFFER_SIZE=100000</LocalDebuggerEnvironment>
   </PropertyGroup>

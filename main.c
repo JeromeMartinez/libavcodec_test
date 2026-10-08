@@ -25,12 +25,14 @@
  */
 
 /*
- * Usage: dec_tx_test <input> <vulkan device> <hw decode 0|1> [encode 0|1] [frames]
+ * Usage: dec_tx_test <input> <vulkan device> <hw decode 0|1> [encode 0|1] [frames] [out.mkv]
  *
  * Decodes the first packet of <input> repeatedly (a decode throughput test).
  * Software-decoded frames are uploaded into Vulkan frames; hardware-decoded
  * frames are used as is. With encode=1, every frame is also encoded with
  * ffv1_vulkan and the encoder is drained at the end so the timing is complete.
+ * The first encoded frame is kept in memory and written to a Matroska file
+ * after the timed loop, so muxing does not affect the measurement.
  */
 
 #include <stdio.h>
@@ -48,10 +50,12 @@
 #include <libswscale/swscale.h>
 
 #define DEFAULT_MAX_FRAMES 1000
+#define DEFAULT_OUTPUT     "first_frame.mkv"
 
 typedef struct EncStats {
     int64_t packets;
     int64_t bytes;
+    AVPacket *first;   /* reference to the first encoded packet, or NULL */
 } EncStats;
 
 /* Formats the Vulkan frames context / ffv1_vulkan want instead of the decoder's. */
@@ -107,6 +111,97 @@ static int decode_next(AVCodecContext *dec, const AVPacket *pkt, AVFrame *frame)
     }
 }
 
+/* Account for an encoded packet; keep a reference to the very first one. */
+static int count_packet(EncStats *st, AVPacket *pkt)
+{
+    if (!st->packets) {
+        st->first = av_packet_clone(pkt);
+        if (!st->first)
+            return AVERROR(ENOMEM);
+    }
+    st->packets++;
+    st->bytes += pkt->size;
+    av_packet_unref(pkt);
+    return 0;
+}
+
+/*
+ * Write a single encoded packet to a Matroska file, using the encoder's
+ * parameters (including the FFV1 extradata) for the stream header.
+ */
+static int write_mkv(const char *path, const AVCodecContext *enc,
+                     enum AVPixelFormat sw_fmt, const AVPacket *src)
+{
+    AVFormatContext *oc = NULL;
+    AVPacket *pkt = NULL;
+    AVStream *st;
+    int ret;
+
+    ret = avformat_alloc_output_context2(&oc, NULL, "matroska", path);
+    if (ret < 0) {
+        fprintf(stderr, "Error creating Matroska muxer: %s\n", av_err2str(ret));
+        return ret;
+    }
+
+    st = avformat_new_stream(oc, NULL);
+    if (!st) {
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
+
+    ret = avcodec_parameters_from_context(st->codecpar, enc);
+    if (ret < 0) {
+        fprintf(stderr, "Error copying encoder parameters: %s\n", av_err2str(ret));
+        goto end;
+    }
+    /* The encoder works on Vulkan frames; the stream must carry the real layout. */
+    st->codecpar->format = sw_fmt;
+    st->time_base        = enc->time_base;
+    st->avg_frame_rate   = enc->framerate;
+
+    if (!(oc->oformat->flags & AVFMT_NOFILE)) {
+        ret = avio_open(&oc->pb, path, AVIO_FLAG_WRITE);
+        if (ret < 0) {
+            fprintf(stderr, "Error opening %s: %s\n", path, av_err2str(ret));
+            goto end;
+        }
+    }
+
+    ret = avformat_write_header(oc, NULL);
+    if (ret < 0) {
+        fprintf(stderr, "Error writing Matroska header: %s\n", av_err2str(ret));
+        goto end;
+    }
+
+    pkt = av_packet_clone(src);
+    if (!pkt) {
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
+    pkt->stream_index = st->index;
+    pkt->pts = pkt->dts = 0;
+    if (pkt->duration <= 0)
+        pkt->duration = 1;
+    av_packet_rescale_ts(pkt, enc->time_base, st->time_base);
+
+    ret = av_write_frame(oc, pkt);
+    if (ret < 0) {
+        fprintf(stderr, "Error writing packet: %s\n", av_err2str(ret));
+        goto end;
+    }
+
+    ret = av_write_trailer(oc);
+    if (ret < 0)
+        fprintf(stderr, "Error writing Matroska trailer: %s\n", av_err2str(ret));
+
+end:
+    av_packet_free(&pkt);
+    if (oc && !(oc->oformat->flags & AVFMT_NOFILE))
+        avio_closep(&oc->pb);
+    avformat_free_context(oc);
+    return ret;
+}
+
 static int receive_packets(AVCodecContext *enc, AVPacket *pkt, EncStats *st)
 {
     for (;;) {
@@ -117,9 +212,9 @@ static int receive_packets(AVCodecContext *enc, AVPacket *pkt, EncStats *st)
             fprintf(stderr, "Error receiving encoded packet: %s\n", av_err2str(ret));
             return ret;
         }
-        st->packets++;
-        st->bytes += pkt->size;
-        av_packet_unref(pkt);
+        ret = count_packet(st, pkt);
+        if (ret < 0)
+            return ret;
     }
 }
 
@@ -140,9 +235,9 @@ static int encode_frame(AVCodecContext *enc, const AVFrame *frame,
                     av_err2str(ret == AVERROR(EAGAIN) ? AVERROR_BUG : ret));
             return ret == AVERROR(EAGAIN) ? AVERROR_BUG : ret;
         }
-        st->packets++;
-        st->bytes += pkt->size;
-        av_packet_unref(pkt);
+        ret = count_packet(st, pkt);
+        if (ret < 0)
+            return ret;
     }
     if (ret < 0) {
         fprintf(stderr, "Error sending frame for encoding: %s\n", av_err2str(ret));
@@ -164,20 +259,24 @@ int main(int argc, const char **argv)
     AVDictionary *opts = NULL;
     const AVCodec *in_dec = NULL;
     const AVDictionaryEntry *e = NULL;
+    const char *out_path = DEFAULT_OUTPUT;
     EncStats st = { 0 };
     enum AVPixelFormat upload_fmt = AV_PIX_FMT_NONE;
     int hw_decoding, do_hw_decode, do_encode, max_frames = DEFAULT_MAX_FRAMES;
     int frames_done = 0;
+    int width = 0, height = 0;   /* real picture size, from the probe frame */
     int64_t time_start;
     double secs;
     int ret, sid;
 
     if (argc < 4) {
         fprintf(stderr,
-                "Usage: %s <input> <vulkan device> <hw decode 0|1> [encode 0|1] [frames]\n"
+                "Usage: %s <input> <vulkan device> <hw decode 0|1> [encode 0|1] [frames] [out.mkv]\n"
                 "  vulkan device: index or name, \"\" for the default device\n"
-                "  frames:        number of frames to process (default %d)\n",
-                argv[0], DEFAULT_MAX_FRAMES);
+                "  frames:        number of frames to process (default %d)\n"
+                "  out.mkv:       where the first encoded frame is written when encoding\n"
+                "                 (default %s, \"\" to skip)\n",
+                argv[0], DEFAULT_MAX_FRAMES, DEFAULT_OUTPUT);
         return 1;
     }
     do_hw_decode = !strcmp(argv[3], "1");
@@ -189,6 +288,8 @@ int main(int argc, const char **argv)
             return 1;
         }
     }
+    if (argc > 6)
+        out_path = argv[6];
 
     av_log_set_level(AV_LOG_VERBOSE);
 
@@ -281,15 +382,42 @@ int main(int argc, const char **argv)
         goto end;
     }
 
+    width  = frame->width;
+    height = frame->height;
+    printf("Stream: %dx%d, decoded frame: %dx%d %s\n",
+           in_ctx->streams[sid]->codecpar->width, in_ctx->streams[sid]->codecpar->height,
+           width, height, fmt_name(frame->format));
+    if (width  != in_ctx->streams[sid]->codecpar->width ||
+        height != in_ctx->streams[sid]->codecpar->height)
+        fprintf(stderr, "Warning: decoded frame size differs from the stream size\n");
+
     hw_decoding = frame->hw_frames_ctx != NULL;
     if (hw_decoding) {
-        printf("Hardware decoding (%s)\n", fmt_name(frame->format));
+        const AVHWFramesContext *dfc;
+
         hwfc_ref = av_buffer_ref(frame->hw_frames_ctx);
         if (!hwfc_ref) {
             ret = AVERROR(ENOMEM);
             goto end;
         }
-        upload_fmt = ((AVHWFramesContext *)hwfc_ref->data)->sw_format;
+        dfc = (const AVHWFramesContext *)hwfc_ref->data;
+        upload_fmt = dfc->sw_format;
+        printf("Hardware decoding: decoder frames context %dx%d %s\n",
+               dfc->width, dfc->height, fmt_name(dfc->sw_format));
+
+        /*
+         * ffv1_vulkan encodes the full size of its frames context, so the
+         * decoder's pool can only be shared when it matches the picture.
+         */
+        if (do_encode && (dfc->width != width || dfc->height != height)) {
+            fprintf(stderr,
+                    "Decoder frames context (%dx%d) does not match the picture (%dx%d); "
+                    "the encoder would produce a wrong-sized frame.\n"
+                    "Run with hw decode = 0 to decode in software and upload instead.\n",
+                    dfc->width, dfc->height, width, height);
+            ret = AVERROR(EINVAL);
+            goto end;
+        }
     } else {
         AVHWFramesContext *hwfc;
 
@@ -309,8 +437,8 @@ int main(int argc, const char **argv)
         hwfc = (AVHWFramesContext *)hwfc_ref->data;
         hwfc->format    = AV_PIX_FMT_VULKAN;
         hwfc->sw_format = upload_fmt;
-        hwfc->width     = frame->width;
-        hwfc->height    = frame->height;
+        hwfc->width     = width;
+        hwfc->height    = height;
 
         ret = av_hwframe_ctx_init(hwfc_ref);
         if (ret < 0) {
@@ -344,9 +472,20 @@ int main(int argc, const char **argv)
             goto end;
         }
 
-        out_avctx->time_base     = av_make_q(1, 1);
-        out_avctx->width         = ((AVHWFramesContext *)hwfc_ref->data)->width;
-        out_avctx->height        = ((AVHWFramesContext *)hwfc_ref->data)->height;
+        {
+            /* Use the input frame rate so the MKV gets a sensible duration. */
+            AVRational fr = in_ctx->streams[sid]->avg_frame_rate;
+            if (fr.num <= 0 || fr.den <= 0)
+                fr = in_ctx->streams[sid]->r_frame_rate;
+            if (fr.num <= 0 || fr.den <= 0)
+                fr = av_make_q(25, 1);
+            out_avctx->framerate = fr;
+            out_avctx->time_base = av_inv_q(fr);
+        }
+        /* Matroska stores codec config in the header (FFV1 extradata). */
+        out_avctx->flags        |= AV_CODEC_FLAG_GLOBAL_HEADER;
+        out_avctx->width         = width;
+        out_avctx->height        = height;
         out_avctx->pix_fmt       = AV_PIX_FMT_VULKAN;
         out_avctx->sw_pix_fmt    = upload_fmt;
         out_avctx->hw_frames_ctx = av_buffer_ref(hwfc_ref);
@@ -426,7 +565,8 @@ int main(int argc, const char **argv)
         }
 
         if (do_encode) {
-            src->pts = i;
+            src->pts      = i;
+        src->duration = 1;
             ret = encode_frame(out_avctx, src, out_pkt, &st);
             if (ret < 0)
                 goto end;
@@ -457,6 +597,19 @@ int main(int argc, const char **argv)
         printf("Encoded %" PRId64 " packets, %" PRId64 " bytes (%.1f MiB/frame)\n",
                st.packets, st.bytes,
                st.packets ? (double)st.bytes / st.packets / (1024.0 * 1024.0) : 0.0);
+
+    /* Outside the timed section: mux the first encoded frame. */
+    if (do_encode && out_path[0]) {
+        if (!st.first) {
+            fprintf(stderr, "No encoded packet to write\n");
+            ret = AVERROR(EINVAL);
+            goto end;
+        }
+        ret = write_mkv(out_path, out_avctx, upload_fmt, st.first);
+        if (ret < 0)
+            goto end;
+        printf("First encoded frame written to %s (%d bytes)\n", out_path, st.first->size);
+    }
     ret = 0;
 
 end:
@@ -467,6 +620,7 @@ end:
     av_frame_free(&hw_frame);
     av_frame_free(&temp);
     av_frame_free(&frame);
+    av_packet_free(&st.first);
     av_packet_free(&out_pkt);
     av_packet_free(&pkt);
     avcodec_free_context(&out_avctx);
