@@ -33,6 +33,11 @@
  * ffv1_vulkan and the encoder is drained at the end so the timing is complete.
  * The first encoded frame is kept in memory and written to a Matroska file
  * after the timed loop, so muxing does not affect the measurement.
+ *
+ * FFV1 decode mode: when <input> is a .mkv file, its first FFV1 packet is
+ * decoded repeatedly instead (with the Vulkan FFV1 hwaccel when hw decode=1),
+ * nothing is uploaded or encoded, and the first decoded frame is saved as a
+ * DPX file after the timed loop.
  */
 
 #include <stdio.h>
@@ -51,6 +56,7 @@
 
 #define DEFAULT_MAX_FRAMES 1000
 #define DEFAULT_OUTPUT     "first_frame.mkv"
+#define DEFAULT_DPX_OUTPUT "first_frame.dpx"
 
 typedef struct EncStats {
     int64_t packets;
@@ -202,6 +208,122 @@ end:
     return ret;
 }
 
+/*
+ * Encode one software frame as a DPX image and write it to a file. The frame
+ * is converted to the closest format the DPX encoder supports if necessary
+ * (e.g. gbrp16 -> rgb48).
+ */
+static int write_dpx(const char *path, const AVFrame *src)
+{
+    const AVCodec *codec = avcodec_find_encoder(AV_CODEC_ID_DPX);
+    const enum AVPixelFormat *fmts = NULL;
+    enum AVPixelFormat dst_fmt = (enum AVPixelFormat)src->format;
+    AVCodecContext *enc = NULL;
+    SwsContext *sws = NULL;
+    AVFrame *conv = NULL;
+    const AVFrame *in = src;
+    AVPacket *pkt = NULL;
+    AVIOContext *io = NULL;
+    int ret, nb_fmts = 0;
+
+    if (!codec) {
+        fprintf(stderr, "DPX encoder not available in this FFmpeg build\n");
+        return AVERROR_ENCODER_NOT_FOUND;
+    }
+
+    ret = avcodec_get_supported_config(NULL, codec, AV_CODEC_CONFIG_PIX_FORMAT, 0,
+                                       (const void **)&fmts, &nb_fmts);
+    if (ret >= 0 && fmts && nb_fmts > 0)
+        dst_fmt = avcodec_find_best_pix_fmt_of_list(fmts, (enum AVPixelFormat)src->format,
+                                                    0, NULL);
+
+    enc = avcodec_alloc_context3(codec);
+    pkt = av_packet_alloc();
+    if (!enc || !pkt) {
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
+    enc->width           = src->width;
+    enc->height          = src->height;
+    enc->pix_fmt         = dst_fmt;
+    enc->time_base       = av_make_q(1, 25);
+    enc->color_range     = src->color_range;
+    enc->color_primaries = src->color_primaries;
+    enc->color_trc       = src->color_trc;
+    enc->colorspace      = src->colorspace;
+
+    ret = avcodec_open2(enc, codec, NULL);
+    if (ret < 0) {
+        fprintf(stderr, "Error opening DPX encoder for %s: %s\n",
+                fmt_name(dst_fmt), av_err2str(ret));
+        goto end;
+    }
+
+    if (dst_fmt != src->format) {
+        conv = av_frame_alloc();
+        sws  = sws_alloc_context();
+        if (!conv || !sws) {
+            ret = AVERROR(ENOMEM);
+            goto end;
+        }
+        conv->width  = src->width;
+        conv->height = src->height;
+        conv->format = dst_fmt;
+        ret = av_frame_get_buffer(conv, 0);
+        if (ret >= 0)
+            ret = av_frame_copy_props(conv, src);
+        if (ret >= 0)
+            ret = sws_scale_frame(sws, conv, src);
+        if (ret < 0) {
+            fprintf(stderr, "Error converting frame to %s: %s\n",
+                    fmt_name(dst_fmt), av_err2str(ret));
+            goto end;
+        }
+        in = conv;
+    }
+
+    ret = avcodec_send_frame(enc, in);
+    if (ret >= 0)
+        ret = avcodec_send_frame(enc, NULL);
+    if (ret >= 0)
+        ret = avcodec_receive_packet(enc, pkt);
+    if (ret < 0) {
+        fprintf(stderr, "Error encoding DPX: %s\n", av_err2str(ret));
+        goto end;
+    }
+
+    /* avio instead of fopen: no MSVC C4996, and UTF-8 paths work on Windows. */
+    ret = avio_open(&io, path, AVIO_FLAG_WRITE);
+    if (ret < 0) {
+        fprintf(stderr, "Error opening %s: %s\n", path, av_err2str(ret));
+        goto end;
+    }
+    avio_write(io, pkt->data, pkt->size);
+    avio_flush(io);
+    if (io->error < 0) {
+        ret = io->error;
+        fprintf(stderr, "Error writing %s: %s\n", path, av_err2str(ret));
+        goto end;
+    }
+    printf("First decoded frame written to %s (%dx%d %s, %d bytes)\n",
+           path, src->width, src->height, fmt_name(dst_fmt), pkt->size);
+    ret = 0;
+
+end:
+    if (io) {
+        int cret = avio_closep(&io);
+        if (cret < 0 && ret >= 0) {
+            ret = cret;
+            fprintf(stderr, "Error closing %s: %s\n", path, av_err2str(ret));
+        }
+    }
+    av_packet_free(&pkt);
+    av_frame_free(&conv);
+    sws_free_context(&sws);
+    avcodec_free_context(&enc);
+    return ret;
+}
+
 static int receive_packets(AVCodecContext *enc, AVPacket *pkt, EncStats *st)
 {
     for (;;) {
@@ -254,15 +376,15 @@ int main(int argc, const char **argv)
     AVCodecContext *in_avctx = NULL, *out_avctx = NULL;
     AVBufferRef *hw_dev_ref = NULL, *hwfc_ref = NULL;
     AVPacket *pkt = NULL, *out_pkt = NULL;
-    AVFrame *frame = NULL, *temp = NULL, *hw_frame = NULL;
+    AVFrame *frame = NULL, *temp = NULL, *hw_frame = NULL, *dpx_frame = NULL;
     SwsContext *swc = NULL;
     AVDictionary *opts = NULL;
     const AVCodec *in_dec = NULL;
     const AVDictionaryEntry *e = NULL;
-    const char *out_path = DEFAULT_OUTPUT;
+    const char *out_path;
     EncStats st = { 0 };
     enum AVPixelFormat upload_fmt = AV_PIX_FMT_NONE;
-    int hw_decoding, do_hw_decode, do_encode, max_frames = DEFAULT_MAX_FRAMES;
+    int hw_decoding, do_hw_decode, do_encode, ffv1_mode, max_frames = DEFAULT_MAX_FRAMES;
     int frames_done = 0;
     int width = 0, height = 0;   /* real picture size, from the probe frame */
     int64_t time_start;
@@ -271,16 +393,25 @@ int main(int argc, const char **argv)
 
     if (argc < 4) {
         fprintf(stderr,
-                "Usage: %s <input> <vulkan device> <hw decode 0|1> [encode 0|1] [frames] [out.mkv]\n"
+                "Usage: %s <input> <vulkan device> <hw decode 0|1> [encode 0|1] [frames] [output]\n"
+                "  input:         any video file; a .mkv input switches to FFV1 decode mode\n"
                 "  vulkan device: index or name, \"\" for the default device\n"
+                "  encode:        1 = also encode with ffv1_vulkan (ignored for .mkv input)\n"
                 "  frames:        number of frames to process (default %d)\n"
-                "  out.mkv:       where the first encoded frame is written when encoding\n"
-                "                 (default %s, \"\" to skip)\n",
-                argv[0], DEFAULT_MAX_FRAMES, DEFAULT_OUTPUT);
+                "  output:        first encoded frame as MKV when encoding (default %s),\n"
+                "                 first decoded frame as DPX for .mkv input (default %s);\n"
+                "                 \"\" to skip\n",
+                argv[0], DEFAULT_MAX_FRAMES, DEFAULT_OUTPUT, DEFAULT_DPX_OUTPUT);
         return 1;
     }
+    ffv1_mode    = av_match_ext(argv[1], "mkv");
     do_hw_decode = !strcmp(argv[3], "1");
     do_encode    = argc > 4 && !strcmp(argv[4], "1");
+    if (ffv1_mode && do_encode) {
+        printf("FFV1 decode mode (.mkv input): encode flag ignored\n");
+        do_encode = 0;
+    }
+    out_path = ffv1_mode ? DEFAULT_DPX_OUTPUT : DEFAULT_OUTPUT;
     if (argc > 5) {
         max_frames = atoi(argv[5]);
         if (max_frames <= 0) {
@@ -313,6 +444,12 @@ int main(int argc, const char **argv)
         goto end;
     }
 
+    if (ffv1_mode && in_dec->id != AV_CODEC_ID_FFV1) {
+        fprintf(stderr, "%s: video stream is %s, not FFV1\n", argv[1], in_dec->name);
+        ret = AVERROR_INVALIDDATA;
+        goto end;
+    }
+
     in_avctx = avcodec_alloc_context3(in_dec);
     if (!in_avctx) {
         ret = AVERROR(ENOMEM);
@@ -326,6 +463,9 @@ int main(int argc, const char **argv)
         goto end;
     }
     in_avctx->pkt_timebase = in_ctx->streams[sid]->time_base;
+    /* Software FFV1 is slice-threaded: let it use all cores, like ffmpeg does. */
+    if (ffv1_mode && !do_hw_decode)
+        in_avctx->thread_count = 0;
 
     /* Vulkan device */
     ret = av_hwdevice_ctx_create(&hw_dev_ref, AV_HWDEVICE_TYPE_VULKAN,
@@ -392,7 +532,38 @@ int main(int argc, const char **argv)
         fprintf(stderr, "Warning: decoded frame size differs from the stream size\n");
 
     hw_decoding = frame->hw_frames_ctx != NULL;
-    if (hw_decoding) {
+    if (ffv1_mode) {
+        if (do_hw_decode && !hw_decoding) {
+            fprintf(stderr, "The Vulkan FFV1 hwaccel was not used (not in this build, or "
+                            "this FFV1 stream is not supported by it)\n");
+            ret = AVERROR(ENOSYS);
+            goto end;
+        }
+        printf("FFV1 decode mode: %s decoding (%s)\n", hw_decoding ? "Vulkan" : "software",
+               fmt_name(hw_decoding ?
+                        ((AVHWFramesContext *)frame->hw_frames_ctx->data)->sw_format :
+                        frame->format));
+        if (hw_decoding)
+            upload_fmt = ((AVHWFramesContext *)frame->hw_frames_ctx->data)->sw_format;
+
+        /* Keep a system-memory copy of the first frame for the DPX output. */
+        dpx_frame = av_frame_alloc();
+        if (!dpx_frame) {
+            ret = AVERROR(ENOMEM);
+            goto end;
+        }
+        if (hw_decoding) {
+            ret = av_hwframe_transfer_data(dpx_frame, frame, 0);
+            if (ret >= 0)
+                ret = av_frame_copy_props(dpx_frame, frame);
+        } else {
+            ret = av_frame_ref(dpx_frame, frame);
+        }
+        if (ret < 0) {
+            fprintf(stderr, "Error keeping the first decoded frame: %s\n", av_err2str(ret));
+            goto end;
+        }
+    } else if (hw_decoding) {
         const AVHWFramesContext *dfc;
 
         hwfc_ref = av_buffer_ref(frame->hw_frames_ctx);
@@ -508,7 +679,8 @@ int main(int argc, const char **argv)
 
     av_log_set_level(AV_LOG_INFO);
 
-    printf("%s %d frames\n", do_encode ? "Decoding and encoding" : "Decoding",
+    printf("%s %d frames\n", do_encode ? "Decoding and encoding" :
+                              ffv1_mode ? "Decoding FFV1" : "Decoding",
            max_frames);
 
     time_start = av_gettime();
@@ -521,9 +693,15 @@ int main(int argc, const char **argv)
             fprintf(stderr, "Error decoding frame %d: %s\n", i, av_err2str(ret));
             goto end;
         }
+        if (frame->width != width || frame->height != height) {
+            fprintf(stderr, "\nFrame %d is %dx%d, expected %dx%d\n",
+                    i, frame->width, frame->height, width, height);
+            ret = AVERROR_INVALIDDATA;
+            goto end;
+        }
         src = frame;
 
-        if (!hw_decoding) {
+        if (!hw_decoding && !ffv1_mode) {
             if (swc) {
                 /* Reuse the conversion buffer unless the upload still holds it. */
                 if (!temp->buf[0] || !av_frame_is_writable(temp)) {
@@ -566,7 +744,7 @@ int main(int argc, const char **argv)
 
         if (do_encode) {
             src->pts      = i;
-        src->duration = 1;
+            src->duration = 1;
             ret = encode_frame(out_avctx, src, out_pkt, &st);
             if (ret < 0)
                 goto end;
@@ -610,6 +788,13 @@ int main(int argc, const char **argv)
             goto end;
         printf("First encoded frame written to %s (%d bytes)\n", out_path, st.first->size);
     }
+
+    /* Outside the timed section: save the first decoded FFV1 frame as DPX. */
+    if (ffv1_mode && out_path[0]) {
+        ret = write_dpx(out_path, dpx_frame);
+        if (ret < 0)
+            goto end;
+    }
     ret = 0;
 
 end:
@@ -617,6 +802,7 @@ end:
         printf("\n");
     sws_free_context(&swc);
     av_dict_free(&opts);
+    av_frame_free(&dpx_frame);
     av_frame_free(&hw_frame);
     av_frame_free(&temp);
     av_frame_free(&frame);
