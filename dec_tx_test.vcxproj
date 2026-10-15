@@ -51,7 +51,12 @@
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
   <PropertyGroup Label="UserMacros">
-    <FFmpegDir>$(ProjectDir)</FFmpegDir>
+    <FFmpegIncludeDir Condition="Exists('$(ProjectDir)ffmpeg\include')">$(ProjectDir)ffmpeg\include</FFmpegIncludeDir>
+    <FFmpegIncludeDir Condition="'$(FFmpegIncludeDir)' == ''">$(ProjectDir)include</FFmpegIncludeDir>
+    <FFmpegLibDir Condition="Exists('$(ProjectDir)ffmpeg\lib')">$(ProjectDir)ffmpeg\lib</FFmpegLibDir>
+    <FFmpegLibDir Condition="'$(FFmpegLibDir)' == ''">$(ProjectDir)</FFmpegLibDir>
+    <FFmpegBinDir Condition="Exists('$(ProjectDir)ffmpeg\bin')">$(ProjectDir)ffmpeg\bin</FFmpegBinDir>
+    <FFmpegBinDir Condition="'$(FFmpegBinDir)' == ''">$(ProjectDir)</FFmpegBinDir>
   </PropertyGroup>
   <ItemDefinitionGroup>
     <ClCompile>
@@ -61,18 +66,17 @@
       <!-- av_err2str() uses a C99 compound literal: compile as real C17, not legacy MSVC C. -->
       <LanguageStandard_C>stdc17</LanguageStandard_C>
       <CompileAs>CompileAsC</CompileAs>
-      <AdditionalIncludeDirectories>$(FFmpegDir)include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(FFmpegIncludeDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <!-- The import libraries (*.lib) sit in the project root, not in a lib\ folder. -->
-      <AdditionalLibraryDirectories>$(FFmpegDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(FFmpegLibDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>avcodec.lib;avformat.lib;avutil.lib;swscale.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <PostBuildEvent>
       <!-- Put the matching FFmpeg DLLs next to the exe so it runs from any working directory. -->
-      <Command>xcopy /y /d /q "$(FFmpegDir)*.dll" "$(OutDir)" &gt;nul</Command>
+      <Command>if exist "$(FFmpegBinDir)\*.dll" xcopy /y /d /q "$(FFmpegBinDir)\*.dll" "$(OutDir)" &gt;nul</Command>
       <Message>Copying FFmpeg DLLs to $(OutDir)</Message>
     </PostBuildEvent>
   </ItemDefinitionGroup>

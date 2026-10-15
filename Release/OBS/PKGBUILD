@@ -1,0 +1,26 @@
+# $Id$
+# Maintainer: MediaArea.net SARL <info@mediaarea.net>
+
+pkgname=libavcodec-test
+pkgver=%VERSION%
+pkgrel=1
+pkgdesc="FFmpeg decoding test tool with patches from MediaArea.net"
+arch=('x86_64')
+url="https://mediaarea.net"
+license=('GPL-3.0-or-later')
+depends=('ffmpeg-ma')
+makedepends=('gcc' 'make')
+source=("libavcodec-test_${pkgver}.tar.xz")
+sha256sums=('SKIP')
+
+build() {
+    cd "libavcodec-test"
+
+    make CFLAGS="-I/usr/include/ffmpeg-ma" FFMPEG_SUFFIX=-ma
+}
+
+package() {
+    cd "libavcodec-test"
+
+    install -Dm755 dec_tx_test "${pkgdir}/usr/bin/dec_tx_test"
+}
