@@ -1,0 +1,16 @@
+Source: libavcodec-test
+Section: utils
+Priority: optional
+Maintainer: MediaArea.net SARL <info@mediaarea.net>
+Build-Depends: debhelper (>= 12), dpkg-dev, make, gcc, ffmpeg-ma-dev
+Standards-Version: 4.6.2
+
+Package: libavcodec-test
+Architecture: any
+Pre-Depends: ${misc:Pre-Depends}
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: FFmpeg decoding test tool with patches from MediaArea.net
+ Decodes a file through the libav*-ma and libsw*-ma libraries and reports
+ the decoding throughput.
+ .
+ This package contains the dec_tx_test command line tool.
